@@ -1,12 +1,18 @@
 package mr
 
-import "fmt"
+import (
+	"fmt"
+	"io/ioutil"
+	"os"
+	"strings"
+	"time"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
 
 //
-// use ihash(key) % NReduce to choose the reduce
+// use ihash(Key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
 //
 func ihash(key string) int {
@@ -21,11 +27,74 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
+	for true {
+		// Your worker implementation here.
+		task := getTaskFromMaster()
+		if task != nil && task.RemainNum > 0 {
+			handleTask(task, mapf, reducef)
+		} else {
+			//退出
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+}
 
+func handleTask(task *Task, mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	switch task.TaskType {
+	case "map":
+		fmt.Printf("map task start  %v %v \n", task.MapTask.TaskId, task.FileName)
+		values := make([]KeyValue, 0)
+		defer func() {
+			call("Coordinator.OnMapFinish", &MapTaskResult{
+				MapTask:   task.MapTask,
+				KeyValues: values,
+			}, &CommonResult{})
+		}()
+
+		//读文件
+		file, err := ioutil.ReadFile(task.FileName)
+		if err != nil {
+			fmt.Printf("read file error fileName:%v %v\n", task.FileName, err)
+			return
+		}
+		task.Contents = string(file)
+		values = append(mapf(task.FileName, task.Contents))
+
+		fmt.Printf("map task finish  %v %v \n", task.MapTask.TaskId, task.FileName)
+
+	case "reduce":
+		fmt.Printf("reduce task start %v\n", task.ReduceTask.TaskId)
+		sb := strings.Builder{}
+		valuesMap := task.ReduceTask.KeyValuesMap
+		for s, strings := range valuesMap {
+			reduceAns := reducef(s, strings)
+			sb.WriteString(fmt.Sprintf("%v %v\n", s, reduceAns))
+		}
+		ioutil.WriteFile(task.ReduceTask.TaskId, []byte(sb.String()), os.ModePerm)
+		fmt.Printf("reduce task finish %v\n", task.ReduceTask.TaskId)
+		call("Coordinator.OnReduceFinish", &ReduceTaskResult{
+			task.ReduceTask,
+		}, &CommonResult{})
+	case "wait":
+		fmt.Println("worker start wait task")
+		time.Sleep(500 * time.Millisecond)
+	case "allFinish":
+		fmt.Println("all task finished  ready to exit ")
+	}
+}
+
+func getTaskFromMaster() *Task {
+
+	task := &Task{}
+	ok := call("Coordinator.GetTask", &TaskRequest{WorkerId: "workder01"}, task)
+	if ok {
+		return task
+	} else {
+		fmt.Println("getTaskFromMaster error ")
+	}
+	return nil
 }
 
 //
