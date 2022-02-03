@@ -3,7 +3,6 @@ package mr
 import (
 	"fmt"
 	"io/ioutil"
-	"os"
 	"strings"
 	"time"
 )
@@ -72,7 +71,7 @@ func handleTask(task *Task, mapf func(string, string) []KeyValue, reducef func(s
 			reduceAns := reducef(s, strings)
 			sb.WriteString(fmt.Sprintf("%v %v\n", s, reduceAns))
 		}
-		ioutil.WriteFile(task.ReduceTask.TaskId, []byte(sb.String()), os.ModePerm)
+		ioutil.WriteFile(task.ReduceTask.TaskId, []byte(sb.String()), 0664)
 		fmt.Printf("reduce task finish %v\n", task.ReduceTask.TaskId)
 		call("Coordinator.OnReduceFinish", &ReduceTaskResult{
 			task.ReduceTask,

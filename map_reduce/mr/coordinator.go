@@ -129,7 +129,9 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
-
+	if c.isAllReduceTaskFinished() {
+		ret = true
+	}
 	return ret
 }
 
