@@ -18,9 +18,11 @@ package raft
 //
 
 import (
+	"math/rand"
 	//	"bytes"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	//	"6.824/labgob"
 	"6.824labs/labrpc"
@@ -60,9 +62,29 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
+	// TODO jinshuan.li 2022/2/5 8:47 AM  数据结构
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	currentTermId     int      //当前termId
+	voteFor           VoteInfo //当前term的投票信息
+	role              Role     //当前状态
+	lastHeartbeatTime time.Time
+	heartbeatTimeout  time.Duration
+	leaderId          int //leaderId
+}
 
+type Role int
+
+const (
+	FOLLOWER Role = iota
+	CANDIDATE
+	LEADER
+)
+
+//投票信息
+type VoteInfo struct {
+	candidateId int
+	termId      int
 }
 
 // return currentTerm and whether this server
@@ -72,6 +94,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	// TODO jinshuan.li 2022/2/5 8:47 AM  获取当前raft节点状态
 	return term, isleader
 }
 
@@ -139,6 +162,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	// TODO jinshuan.li 2022/2/5 8:47 AM  选举请求数据结构
+	CurrentTermId int
+	ClientId      int
+	ClientName    string
 }
 
 //
@@ -147,13 +174,23 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	// TODO jinshuan.li 2022/2/5 8:48 AM  选举请求返回数据结构
+	Accept  bool
+	Message string
 }
 
 //
-// example RequestVote RPC handler.
+// 收到投票信息时处理
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	// TODO jinshuan.li 2022/2/5 8:48 AM  处理选举请求
+
+	Println("receive RequestVote:%v clientId:%v\n", args, rf.me)
+
+	reply.Accept = true
+	reply.Message = "accept vote"
+
 }
 
 //
@@ -235,6 +272,11 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+const (
+	kMinHeartbeatMs = 300
+	kMaxHeartbeatMs = 500
+)
+
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
@@ -243,7 +285,35 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		time.Sleep(rf.heartbeatTimeout)
+		if time.Now().Sub(rf.lastHeartbeatTime) >= rf.heartbeatTimeout {
+			//当前时间-上一次心跳时间 > 心跳超时时间 发起投票
+			rf.sendRequestVote2Others()
+		}
+	}
+}
 
+func (rf *Raft) init() {
+	//初始化心跳超时时间
+	rf.heartbeatTimeout = time.Duration(rand.Intn(kMaxHeartbeatMs-kMinHeartbeatMs)+kMaxHeartbeatMs) * time.Millisecond
+	//上一次心跳时间 为当前时间
+	rf.lastHeartbeatTime = time.Now()
+	rf.currentTermId = 0
+}
+
+func (rf *Raft) sendRequestVote2Others() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//状态转变
+	rf.role = CANDIDATE
+	//增加任期
+	rf.currentTermId += 1
+	for i, _ := range rf.peers {
+		if i != rf.me {
+			voteArgs := &RequestVoteArgs{}
+			requestVoteReply := &RequestVoteReply{}
+			rf.sendRequestVote(i, voteArgs, requestVoteReply)
+		}
 	}
 }
 
@@ -266,7 +336,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-
+	// TODO jinshuan.li 2022/2/5 8:48 AM  初始化
+	rf.init()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
