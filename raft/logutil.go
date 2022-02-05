@@ -13,5 +13,5 @@ func Println(format string, a ...interface{}) {
 		m, _ := json.Marshal(d)
 		args[i] = string(m)
 	}
-	fmt.Printf(time.Now().Format("2006-01-02 15:04:05.000 ")+format, args...)
+	fmt.Printf(time.Now().Format("2006-01-02 15:04:05.000 ")+format+"\n", args...)
 }

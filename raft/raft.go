@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"context"
+	"errors"
 	"math/rand"
 	//	"bytes"
 	"sync"
@@ -201,35 +203,51 @@ func (rf *Raft) RequestHeartbeat(args *RequestHeartbeat, reply *RequestHeartbeat
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if (args.CurrentTermId > rf.currentTermId && rf.role == CANDIDATE) || (rf.role == FOLLOWER && args.CurrentTermId >= rf.currentTermId) {
-		Println("node:%v accept RequestHeartbeat:%v\n", rf.nodeInfo, args)
-		oldId := rf.currentTermId
-		rf.currentTermId = args.CurrentTermId
-		rf.lastHeartbeatTime = time.Now()
-		rf.voteFor = &VoteInfo{
-			candidateId: args.NodeId,
-			termId:      args.CurrentTermId,
-		}
-		rf.leaderId = args.NodeId
-		rf.role = FOLLOWER
-
-		reply.Valide = true
-		reply.NodeId = rf.nodeInfo.NodeId
-		reply.CurrentTermId = oldId
-
-	} else if args.CurrentTermId < rf.currentTermId {
+	if args.CurrentTermId < rf.currentTermId {
 		//拒绝 这个心跳
-		Println("reject RequestHeartbeat:%v\n", args)
+		Println("reject RequestHeartbeat nodeInfo:%v  currentTermId:%v role:%v args:%v \n", rf.nodeInfo, rf.currentTermId, rf.role, args)
 		reply.Valide = false
 		reply.NodeId = rf.nodeInfo.NodeId
 		reply.CurrentTermId = rf.currentTermId
-	} else {
-		Println("error condition RequestHeartbeat %v %v \n", rf.nodeInfo, args)
-		reply.Valide = false
-		reply.NodeId = rf.nodeInfo.NodeId
-		reply.CurrentTermId = rf.currentTermId
+
+		return
 	}
 
+	switch rf.role {
+
+	case LEADER:
+		if args.CurrentTermId > rf.currentTermId {
+			rf.followLeaderState(args, reply)
+		} else {
+			//TODO jinshuan.li 2022/2/5 19:58 一般情况下不会到这个状态 打日志排查错误
+			Println("error condition RequestHeartbeat nodeInfo:%v  currentTermId:%v role:%v args:%v \n", rf.nodeInfo, rf.currentTermId, rf.role, args)
+			reply.Valide = false
+			reply.NodeId = rf.nodeInfo.NodeId
+			reply.CurrentTermId = rf.currentTermId
+			//出现这种情况 重新选举
+			go rf.startLeaderElection()
+		}
+	case CANDIDATE:
+		rf.followLeaderState(args, reply)
+	case FOLLOWER:
+		rf.followLeaderState(args, reply)
+	}
+}
+func (rf *Raft) followLeaderState(args *RequestHeartbeat, reply *RequestHeartbeatReply) {
+	Println("node:%v accept RequestHeartbeat:%v\n", rf.nodeInfo, args)
+	oldId := rf.currentTermId
+	rf.currentTermId = args.CurrentTermId
+	rf.lastHeartbeatTime = time.Now()
+	rf.voteFor = &VoteInfo{
+		candidateId: args.NodeId,
+		termId:      args.CurrentTermId,
+	}
+	rf.leaderId = args.NodeId
+	rf.role = FOLLOWER
+
+	reply.Valide = true
+	reply.NodeId = rf.nodeInfo.NodeId
+	reply.CurrentTermId = oldId
 }
 
 //
@@ -295,7 +313,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
-func (rf *Raft) sendRequestHeartbeat(server int, args *RequestHeartbeat, reply *RequestHeartbeat) bool {
+func (rf *Raft) sendRequestHeartbeat(server int, args *RequestHeartbeat, reply *RequestHeartbeatReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestHeartbeat", args, reply)
 	return ok
 }
@@ -361,7 +379,14 @@ func (rf *Raft) ticker() {
 		time.Sleep(rf.heartbeatTimeout)
 		if time.Now().Sub(rf.lastHeartbeatTime) >= rf.heartbeatTimeout {
 			//当前时间-上一次心跳时间 > 心跳超时时间 发起投票
-			rf.sendRequestVote2Others()
+			for true {
+				rf.startLeaderElection()
+				if rf.role != CANDIDATE {
+					//只要没有选出来 一直选
+					break
+				}
+			}
+
 		}
 	}
 }
@@ -388,14 +413,15 @@ func (rf *Raft) init() {
 	}
 }
 
-func (rf *Raft) sendRequestVote2Others() {
+func (rf *Raft) startLeaderElection() bool {
 	rf.meu.Lock()
 	defer rf.meu.Unlock()
 
 	if rf.role == LEADER {
 		//如果是leader直接跳过
-		return
+		return true
 	}
+	electionTimeout := time.Duration(rand.Intn(kMaxHeartbeatMs-kMinHeartbeatMs)+kMaxHeartbeatMs) / 2 * time.Millisecond
 	Println("node %v start to election leader \n", rf.nodeInfo)
 	//状态转变
 	rf.role = CANDIDATE
@@ -421,11 +447,19 @@ func (rf *Raft) sendRequestVote2Others() {
 		}
 		requestVoteReply := &RequestVoteReply{}
 		startTime := time.Now()
-		vote := rf.sendRequestVote(i, voteArgs, requestVoteReply)
+		vote, err := rf.sendRequestVoteWithTimeout(i, voteArgs, requestVoteReply, kMinHeartbeatMs/len(rf.peers))
+		if err != nil {
+			//超时
+			vote = false
+		}
+		if time.Now().Sub(rf.lastHeartbeatTime) > electionTimeout {
+			//选举超时 直接不选了
+			return false
+		}
 		if rf.role == FOLLOWER {
 			//如果角色转变 直接break  发送投票请求期间可能收到心跳 从而导致角色变化 待处理
 			Println("node %v change to FOLLOWER when vote.\n", rf.nodeInfo)
-			break
+			return false
 		}
 		endTime := time.Now()
 		if vote && requestVoteReply.Accept {
@@ -437,19 +471,24 @@ func (rf *Raft) sendRequestVote2Others() {
 				voteFailNum += 1
 			}
 			Println("node %v ask for vote %v fail %v cost:%v\n", rf.nodeInfo, i, requestVoteReply, endTime.Sub(startTime).Milliseconds())
+			if requestVoteReply.TermId > rf.currentTermId {
+				//如果返回值的termId比当前大  直接转换为follower
+				rf.currentTermId = requestVoteReply.TermId
+				rf.role = FOLLOWER
+				Println("node %v change to FOLLOWER when vote.\n", rf.nodeInfo)
+				return false
+			}
 		}
 	}
 	Println("node %v vote result. voteAcceptNum:%v voteFailNum:%v\n", rf.nodeInfo, voteAcceptNum, voteFailNum)
-	if voteAcceptNum > (len(rf.peers)-voteFailNum)/2 {
+	if voteAcceptNum > (len(rf.peers)-voteFailNum)/2 && voteAcceptNum >= 2 {
 		//超过一半投自己 开始转变角色
 		rf.role = LEADER
 		Println("node:%v become leader\n", rf.nodeInfo)
 		rf.sendHeartbeat2Others()
-	} else {
-		//回退任期 回退角色
-		rf.currentTermId -= 1
-		rf.role = FOLLOWER
+		return true
 	}
+	return false
 }
 
 func (rf *Raft) sendHeartbeat2Others() {
@@ -463,16 +502,40 @@ func (rf *Raft) sendHeartbeat2Others() {
 				}
 				//如果断开链接 同步调用会导致更新lastHeartbeatTime超时 从而触发重新选举
 				go func(index int) {
+					r := &RequestHeartbeatReply{}
 					rf.sendRequestHeartbeat(index, &RequestHeartbeat{
 						CurrentTermId: rf.currentTermId,
 						NodeId:        rf.nodeInfo.NodeId,
-					}, &RequestHeartbeat{})
+					}, r)
+					if r.CurrentTermId > rf.currentTermId {
+						rf.currentTermId = r.CurrentTermId
+						rf.role = FOLLOWER
+					}
 				}(i)
 			}
 			//发完之后sleep一段时间
 			time.Sleep(kMinHeartbeatMs / 2 * time.Millisecond)
 		}
 	}()
+}
+
+func (rf *Raft) sendRequestVoteWithTimeout(i int, args *RequestVoteArgs, reply *RequestVoteReply, timeoutMs int) (bool, error) {
+	timeout, _ := context.WithTimeout(
+		context.Background(),
+		time.Millisecond*time.Duration(timeoutMs),
+	)
+	chRet := make(chan bool)
+	go func() {
+		vote := rf.sendRequestVote(i, args, reply)
+		chRet <- vote
+	}()
+	select {
+	case ans := <-chRet:
+		return ans, nil
+	case <-timeout.Done():
+		return false, errors.New("time out")
+	}
+
 }
 
 //
@@ -494,7 +557,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	// TODO jinshuan.li 2022/2/5 8:48 AM  初始化
+	// 初始化
 	rf.init()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
