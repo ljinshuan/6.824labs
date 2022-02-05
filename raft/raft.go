@@ -65,12 +65,21 @@ type Raft struct {
 	// TODO jinshuan.li 2022/2/5 8:47 AM  数据结构
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTermId     int      //当前termId
-	voteFor           VoteInfo //当前term的投票信息
-	role              Role     //当前状态
+	nodeMap           map[int]*NodeInfo
+	currentTermId     int       //当前termId
+	voteFor           *VoteInfo //当前term的投票信息
+	role              Role      //当前状态
 	lastHeartbeatTime time.Time
 	heartbeatTimeout  time.Duration
 	leaderId          int //leaderId
+	nodeInfo          *NodeInfo
+	meu               sync.Mutex
+}
+
+type NodeInfo struct {
+	NodeId   int
+	NodeName interface{}
+	Enable   bool
 }
 
 type Role int
@@ -91,11 +100,8 @@ type VoteInfo struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	// TODO jinshuan.li 2022/2/5 8:47 AM  获取当前raft节点状态
-	return term, isleader
+	//  获取当前raft节点状态
+	return rf.currentTermId, rf.role == LEADER
 }
 
 //
@@ -164,8 +170,8 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	// TODO jinshuan.li 2022/2/5 8:47 AM  选举请求数据结构
 	CurrentTermId int
-	ClientId      int
-	ClientName    string
+	NodeId        int
+	NodeName      interface{}
 }
 
 //
@@ -174,9 +180,56 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	// TODO jinshuan.li 2022/2/5 8:48 AM  选举请求返回数据结构
 	Accept  bool
 	Message string
+	TermId  int
+}
+
+type RequestHeartbeat struct {
+	CurrentTermId int
+	NodeId        int
+}
+
+type RequestHeartbeatReply struct {
+	CurrentTermId int
+	NodeId        int
+	Valide        bool
+}
+
+func (rf *Raft) RequestHeartbeat(args *RequestHeartbeat, reply *RequestHeartbeatReply) {
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if (args.CurrentTermId > rf.currentTermId && rf.role == CANDIDATE) || (rf.role == FOLLOWER && args.CurrentTermId >= rf.currentTermId) {
+		Println("node:%v accept RequestHeartbeat:%v\n", rf.nodeInfo, args)
+		oldId := rf.currentTermId
+		rf.currentTermId = args.CurrentTermId
+		rf.lastHeartbeatTime = time.Now()
+		rf.voteFor = &VoteInfo{
+			candidateId: args.NodeId,
+			termId:      args.CurrentTermId,
+		}
+		rf.leaderId = args.NodeId
+		rf.role = FOLLOWER
+
+		reply.Valide = true
+		reply.NodeId = rf.nodeInfo.NodeId
+		reply.CurrentTermId = oldId
+
+	} else if args.CurrentTermId < rf.currentTermId {
+		//拒绝 这个心跳
+		Println("reject RequestHeartbeat:%v\n", args)
+		reply.Valide = false
+		reply.NodeId = rf.nodeInfo.NodeId
+		reply.CurrentTermId = rf.currentTermId
+	} else {
+		Println("error condition RequestHeartbeat %v %v \n", rf.nodeInfo, args)
+		reply.Valide = false
+		reply.NodeId = rf.nodeInfo.NodeId
+		reply.CurrentTermId = rf.currentTermId
+	}
+
 }
 
 //
@@ -184,12 +237,28 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	// TODO jinshuan.li 2022/2/5 8:48 AM  处理选举请求
+	//  处理选举请求
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	Println("receive RequestVote:%v clientId:%v\n", args, rf.me)
-
-	reply.Accept = true
-	reply.Message = "accept vote"
+	Println("clientId:%v  receive RequestVote:%v\n", rf.me, args)
+	if rf.currentTermId < args.CurrentTermId {
+		//当前任期 比期望投票的任期小 同意投票
+		reply.Accept = true
+		reply.Message = "accept vote"
+		rf.voteFor = &VoteInfo{
+			candidateId: args.NodeId,
+			termId:      args.CurrentTermId,
+		}
+		rf.currentTermId = args.CurrentTermId
+		rf.leaderId = args.NodeId
+		rf.role = FOLLOWER
+	} else {
+		//拒绝
+		reply.Accept = false
+		reply.Message = "less termId"
+		reply.TermId = rf.currentTermId
+	}
 
 }
 
@@ -224,6 +293,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+func (rf *Raft) sendRequestHeartbeat(server int, args *RequestHeartbeat, reply *RequestHeartbeat) bool {
+	ok := rf.peers[server].Call("Raft.RequestHeartbeat", args, reply)
 	return ok
 }
 
@@ -273,8 +346,8 @@ func (rf *Raft) killed() bool {
 }
 
 const (
-	kMinHeartbeatMs = 300
-	kMaxHeartbeatMs = 500
+	kMinHeartbeatMs = 150
+	kMaxHeartbeatMs = 300
 )
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -295,26 +368,111 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) init() {
 	//初始化心跳超时时间
+	rf.role = FOLLOWER
 	rf.heartbeatTimeout = time.Duration(rand.Intn(kMaxHeartbeatMs-kMinHeartbeatMs)+kMaxHeartbeatMs) * time.Millisecond
 	//上一次心跳时间 为当前时间
 	rf.lastHeartbeatTime = time.Now()
 	rf.currentTermId = 0
+	rf.nodeInfo = &NodeInfo{
+		NodeId:   rf.me,
+		NodeName: rf.peers[rf.me].GetEndName(),
+		Enable:   true,
+	}
+	rf.nodeMap = map[int]*NodeInfo{}
+	for i, peer := range rf.peers {
+		rf.nodeMap[i] = &NodeInfo{
+			NodeId:   i,
+			NodeName: peer.GetEndName(),
+			Enable:   true,
+		}
+	}
 }
 
 func (rf *Raft) sendRequestVote2Others() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.meu.Lock()
+	defer rf.meu.Unlock()
+
+	if rf.role == LEADER {
+		//如果是leader直接跳过
+		return
+	}
+	Println("node %v start to election leader \n", rf.nodeInfo)
 	//状态转变
 	rf.role = CANDIDATE
+	rf.voteFor = &VoteInfo{
+		candidateId: rf.nodeInfo.NodeId,
+		termId:      rf.currentTermId,
+	}
+	rf.lastHeartbeatTime = time.Now()
 	//增加任期
 	rf.currentTermId += 1
-	for i, _ := range rf.peers {
-		if i != rf.me {
-			voteArgs := &RequestVoteArgs{}
-			requestVoteReply := &RequestVoteReply{}
-			rf.sendRequestVote(i, voteArgs, requestVoteReply)
+	//自己有一票投自己
+	voteAcceptNum := 1
+	voteFailNum := 0
+
+	for i, _ := range rf.nodeMap {
+		if i == rf.me {
+			continue
+		}
+		voteArgs := &RequestVoteArgs{
+			CurrentTermId: rf.currentTermId,
+			NodeId:        rf.nodeInfo.NodeId,
+			NodeName:      rf.nodeInfo.NodeName,
+		}
+		requestVoteReply := &RequestVoteReply{}
+		startTime := time.Now()
+		vote := rf.sendRequestVote(i, voteArgs, requestVoteReply)
+		if rf.role == FOLLOWER {
+			//如果角色转变 直接break  发送投票请求期间可能收到心跳 从而导致角色变化 待处理
+			Println("node %v change to FOLLOWER when vote.\n", rf.nodeInfo)
+			break
+		}
+		endTime := time.Now()
+		if vote && requestVoteReply.Accept {
+			voteAcceptNum += 1
+			Println("node %v ask for vote %v success cost:%v\n", rf.nodeInfo, i, endTime.Sub(startTime).Milliseconds())
+		} else {
+			if !vote {
+				requestVoteReply.Message = "call fail"
+				voteFailNum += 1
+			}
+			Println("node %v ask for vote %v fail %v cost:%v\n", rf.nodeInfo, i, requestVoteReply, endTime.Sub(startTime).Milliseconds())
 		}
 	}
+	Println("node %v vote result. voteAcceptNum:%v voteFailNum:%v\n", rf.nodeInfo, voteAcceptNum, voteFailNum)
+	if voteAcceptNum > (len(rf.peers)-voteFailNum)/2 {
+		//超过一半投自己 开始转变角色
+		rf.role = LEADER
+		Println("node:%v become leader\n", rf.nodeInfo)
+		rf.sendHeartbeat2Others()
+	} else {
+		//回退任期 回退角色
+		rf.currentTermId -= 1
+		rf.role = FOLLOWER
+	}
+}
+
+func (rf *Raft) sendHeartbeat2Others() {
+
+	go func() {
+		for rf.role == LEADER {
+			for i, _ := range rf.peers {
+				if i == rf.me {
+					rf.lastHeartbeatTime = time.Now()
+					continue
+				}
+				//如果断开链接 同步调用会导致更新lastHeartbeatTime超时 从而触发重新选举
+				go func(index int) {
+					rf.sendRequestHeartbeat(index, &RequestHeartbeat{
+						CurrentTermId: rf.currentTermId,
+						NodeId:        rf.nodeInfo.NodeId,
+					}, &RequestHeartbeat{})
+				}(i)
+			}
+			//发完之后sleep一段时间
+			time.Sleep(kMinHeartbeatMs / 2 * time.Millisecond)
+		}
+	}()
 }
 
 //

@@ -80,6 +80,11 @@ type ClientEnd struct {
 	done    chan struct{} // closed when Network is cleaned up
 }
 
+func (e *ClientEnd) GetEndName() interface{} {
+
+	return e.endname
+}
+
 // send an RPC, wait for the reply.
 // the return value indicates success; false means that
 // no reply was received from the server.
