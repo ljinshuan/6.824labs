@@ -505,8 +505,10 @@ func (cfg *config) wait(index int, n int, startTerm int) interface{} {
 func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 	t0 := time.Now()
 	starts := 0
+	//10秒钟时间
 	for time.Since(t0).Seconds() < 10 {
 		// try all the servers, maybe one is the leader.
+		//这里是在找一个leader的索引
 		index := -1
 		for si := 0; si < cfg.n; si++ {
 			starts = (starts + 1) % cfg.n
@@ -544,6 +546,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 			}
 		} else {
+			//没找到50毫秒之后继续找
 			time.Sleep(50 * time.Millisecond)
 		}
 	}

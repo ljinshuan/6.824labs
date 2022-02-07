@@ -67,6 +67,7 @@ type Raft struct {
 	// TODO jinshuan.li 2022/2/5 8:47 AM  数据结构
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	//选举相关
 	nodeMap           map[int]*NodeInfo
 	currentTermId     int       //当前termId
 	voteFor           *VoteInfo //当前term的投票信息
@@ -76,8 +77,33 @@ type Raft struct {
 	leaderId          int //leaderId
 	nodeInfo          *NodeInfo
 	meu               sync.Mutex
+
+	//日志相关数据
+	LogInfo
+	//主节点相关数据
+	LeaderInfo
+	//存储的日志
+	logEntries []LogRecord
 }
 
+type LogRecord struct {
+	TermId int
+	Cmd    interface{}
+}
+
+//日志信息
+type LogInfo struct {
+	commitIndex      int
+	lastAppliedIndex int
+}
+
+//leader需要维护的 针对每个follower 当前日志索引 以及下一个日志索引
+type LeaderInfo struct {
+	nextIndexArr  []int
+	matchIndexArr []int
+}
+
+//节点信息
 type NodeInfo struct {
 	NodeId   int
 	NodeName interface{}
@@ -170,7 +196,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	// TODO jinshuan.li 2022/2/5 8:47 AM  选举请求数据结构
+	// 选举请求数据结构
 	CurrentTermId int
 	NodeId        int
 	NodeName      interface{}
@@ -196,6 +222,20 @@ type RequestHeartbeatReply struct {
 	CurrentTermId int
 	NodeId        int
 	Valide        bool
+}
+
+type RequestAppendLog struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogRecord
+	LeaderCommit int
+}
+
+type RequestAppendLogReply struct {
+	Term    int
+	Success bool
 }
 
 func (rf *Raft) RequestHeartbeat(args *RequestHeartbeat, reply *RequestHeartbeatReply) {
@@ -234,7 +274,7 @@ func (rf *Raft) RequestHeartbeat(args *RequestHeartbeat, reply *RequestHeartbeat
 	}
 }
 func (rf *Raft) followLeaderState(args *RequestHeartbeat, reply *RequestHeartbeatReply) {
-	Println("node:%v accept RequestHeartbeat:%v\n", rf.nodeInfo, args)
+	//Println("node:%v accept RequestHeartbeat:%v\n", rf.nodeInfo, args)
 	oldId := rf.currentTermId
 	rf.currentTermId = args.CurrentTermId
 	rf.lastHeartbeatTime = time.Now()
@@ -332,14 +372,17 @@ func (rf *Raft) sendRequestHeartbeat(server int, args *RequestHeartbeat, reply *
 // term. the third return value is true if this server believes it is
 // the leader.
 //
+/**
+Star 开始准备commit  返回值 1 当前命令在该节点应该提交的index  2 如果已经提交了 第二个参数返回当前term
+3 是否是leader
+*/
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	index := rf.nodeInfo.NodeId
+	term := rf.currentTermId
 
 	// Your code here (2B).
 
-	return index, term, isLeader
+	return index, term, rf.role == LEADER
 }
 
 //
@@ -410,6 +453,17 @@ func (rf *Raft) init() {
 			NodeName: peer.GetEndName(),
 			Enable:   true,
 		}
+	}
+
+	// init for  log
+	rf.logEntries = make([]LogRecord, 0)
+	rf.LogInfo = LogInfo{
+		commitIndex:      0,
+		lastAppliedIndex: 0,
+	}
+	rf.LeaderInfo = LeaderInfo{
+		nextIndexArr:  make([]int, len(rf.peers)),
+		matchIndexArr: make([]int, len(rf.peers)),
 	}
 }
 
