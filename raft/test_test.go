@@ -525,7 +525,7 @@ loop:
 			cmds = append(cmds, x)
 			index1, term1, ok := cfg.rafts[leader].Start(x)
 			if term1 != term {
-				// Term changed while starting
+				// CurrentTermId changed while starting
 				continue loop
 			}
 			if !ok {

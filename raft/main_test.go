@@ -33,3 +33,10 @@ func TestName(t *testing.T) {
 		fmt.Println("time out")
 	}
 }
+func TestSubSlic(t *testing.T) {
+
+	abc := []int{1, 2, 3, 4, 5, 6}
+	fmt.Println(abc)
+	a := abc[0:2]
+	fmt.Println(a)
+}

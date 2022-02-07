@@ -20,6 +20,7 @@ package raft
 import (
 	"context"
 	"errors"
+	"math"
 	"math/rand"
 	//	"bytes"
 	"sync"
@@ -90,8 +91,9 @@ type Raft struct {
 }
 
 type LogRecord struct {
-	TermId int
-	Cmd    interface{}
+	TermId   int
+	Cmd      interface{}
+	LogIndex int
 }
 
 //日志信息
@@ -239,8 +241,8 @@ type RequestAppendLog struct {
 }
 
 type RequestAppendLogReply struct {
-	Term    int
-	Success bool
+	CurrentTermId int
+	Success       bool
 }
 
 func (rf *Raft) RequestHeartbeat(args *RequestHeartbeat, reply *RequestHeartbeatReply) {
@@ -331,18 +333,56 @@ func (rf *Raft) RequestAppendLog(args *RequestAppendLog, reply *RequestAppendLog
 
 	if rf.role != FOLLOWER {
 		reply.Success = false
-		reply.Term = rf.currentTermId
+		reply.CurrentTermId = rf.currentTermId
 		return
 	}
-
-	rf.lastAppliedIndex = args.CommandIndex
-	rf.applyCh <- ApplyMsg{
-		CommandValid: args.ApplyMsg.CommandValid,
-		Command:      args.ApplyMsg.Command,
-		CommandIndex: args.ApplyMsg.CommandIndex,
+	accept := true
+	if args.Term < rf.currentTermId {
+		accept = false
 	}
-	reply.Success = true
-	reply.Term = rf.currentTermId
+	if args.PrevLogIndex != 0 && args.PrevLogTerm != 0 {
+		if len(rf.logEntries) < args.PrevLogIndex {
+			//长度小于这个值 不可能有数据
+			accept = false
+		} else {
+			record := rf.logEntries[args.PrevLogIndex-1]
+			if record.TermId != args.PrevLogTerm {
+				accept = false
+			}
+		}
+
+		if len(rf.logEntries) >= args.CommandIndex {
+			record := rf.logEntries[args.CommandIndex-1]
+			//这个index已经有log了 检查term
+			if record.TermId != args.Term {
+				//删除该数据
+				rf.logEntries = rf.logEntries[0 : args.CommandIndex-1]
+			}
+		}
+	}
+
+	if accept {
+
+		rf.logEntries = append(rf.logEntries, LogRecord{
+			TermId:   args.Term,
+			Cmd:      args.Command,
+			LogIndex: args.CommandIndex,
+		})
+		rf.lastAppliedIndex = args.CommandIndex
+
+		reply.Success = true
+		reply.CurrentTermId = rf.currentTermId
+	}
+
+	if !accept {
+		reply.Success = false
+		reply.CurrentTermId = rf.currentTermId
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(args.CommandIndex)))
+	}
+
 }
 
 //
@@ -419,27 +459,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command:      command,
 		CommandIndex: commandIdnex,
 	}
+	rf.logEntries = append(rf.logEntries, LogRecord{
+		TermId:   rf.currentTermId,
+		Cmd:      command,
+		LogIndex: commandIdnex,
+	})
+	go rf.startAgreementApply(applyMsg)
 
-	validateCnt := 0
-	replyCnt := 0
-	for i, _ := range rf.peers {
-		if i == rf.me {
-			//自己节点
-			continue
-		}
-		request := &RequestAppendLog{
-			ApplyMsg: applyMsg,
-		}
-		reply := &RequestAppendLogReply{}
-		ok, err := rf.sendRequestApplyMessageTimeout(i, request, reply, kMinHeartbeatMs/len(rf.peers))
-		if err != nil {
-			//超时了 不处理
-		}
-		if ok && reply.Success {
-			validateCnt += 1
-		}
-	}
-	Println("node %v apply result  replyCnt:%v validateCnt:%v", rf.nodeInfo, replyCnt, validateCnt)
 	rf.lastAppliedIndex = commandIdnex
 	rf.applyCh <- applyMsg
 	return commandIdnex, term, rf.role == LEADER
@@ -673,6 +699,57 @@ func (rf *Raft) sendRequestApplyMessageTimeout(i int, args *RequestAppendLog, re
 
 func (rf *Raft) isLeader() bool {
 	return rf.role == LEADER
+}
+
+func (rf *Raft) startAgreementApply(applyMsg ApplyMsg) {
+
+	if !rf.isLeader() {
+		return
+	}
+	validateCnt := 0
+	replyCnt := 0
+	//取上一条日志
+	var record LogRecord = LogRecord{
+		TermId:   0,
+		LogIndex: 0,
+	}
+	if len(rf.logEntries) > 0 {
+		record = rf.logEntries[applyMsg.CommandIndex-1]
+	}
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			//自己节点
+			continue
+		}
+		request := &RequestAppendLog{
+			Term:         rf.currentTermId,
+			LeaderId:     rf.nodeInfo.NodeId,
+			PrevLogIndex: record.LogIndex,
+			PrevLogTerm:  record.TermId,
+			Entries:      nil,
+			LeaderCommit: rf.commitIndex,
+			ApplyMsg:     applyMsg,
+		}
+		reply := &RequestAppendLogReply{}
+		ok, err := rf.sendRequestApplyMessageTimeout(i, request, reply, kMinHeartbeatMs/len(rf.peers))
+		if err != nil {
+			//超时了 不处理
+		}
+		if ok && reply.Success {
+			validateCnt += 1
+		}
+		if reply.CurrentTermId > rf.currentTermId {
+			rf.currentTermId = reply.CurrentTermId
+			rf.role = FOLLOWER
+		}
+	}
+	Println("node %v apply result  replyCnt:%v validateCnt:%v", rf.nodeInfo, replyCnt, validateCnt)
+	//超过半数同意 提交
+	if validateCnt >= 1 && validateCnt >= replyCnt/2 {
+		//提交
+		rf.commitIndex = applyMsg.CommandIndex
+		rf.applyCh <- applyMsg
+	}
 }
 
 //
