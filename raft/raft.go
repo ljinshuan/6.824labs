@@ -82,8 +82,11 @@ type Raft struct {
 	LogInfo
 	//主节点相关数据
 	LeaderInfo
+
 	//存储的日志
 	logEntries []LogRecord
+	//apply队列 apply之后把数据写到该chan中
+	applyCh chan ApplyMsg
 }
 
 type LogRecord struct {
@@ -231,6 +234,8 @@ type RequestAppendLog struct {
 	PrevLogTerm  int
 	Entries      []LogRecord
 	LeaderCommit int
+
+	ApplyMsg
 }
 
 type RequestAppendLogReply struct {
@@ -320,6 +325,26 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 }
 
+func (rf *Raft) RequestAppendLog(args *RequestAppendLog, reply *RequestAppendLogReply) {
+
+	Println("node %v get append request %v", rf.nodeInfo, args)
+
+	if rf.role != FOLLOWER {
+		reply.Success = false
+		reply.Term = rf.currentTermId
+		return
+	}
+
+	rf.lastAppliedIndex = args.CommandIndex
+	rf.applyCh <- ApplyMsg{
+		CommandValid: args.ApplyMsg.CommandValid,
+		Command:      args.ApplyMsg.Command,
+		CommandIndex: args.ApplyMsg.CommandIndex,
+	}
+	reply.Success = true
+	reply.Term = rf.currentTermId
+}
+
 //
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -357,6 +382,10 @@ func (rf *Raft) sendRequestHeartbeat(server int, args *RequestHeartbeat, reply *
 	ok := rf.peers[server].Call("Raft.RequestHeartbeat", args, reply)
 	return ok
 }
+func (rf *Raft) sendRequestApplyMessage(server int, args *RequestAppendLog, reply *RequestAppendLogReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestAppendLog", args, reply)
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -377,12 +406,43 @@ Star 开始准备commit  返回值 1 当前命令在该节点应该提交的inde
 3 是否是leader
 */
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := rf.nodeInfo.NodeId
+
 	term := rf.currentTermId
 
+	if !rf.isLeader() {
+		return -1, -1, false
+	}
 	// Your code here (2B).
+	commandIdnex := rf.lastAppliedIndex + 1
+	applyMsg := ApplyMsg{
+		CommandValid: true,
+		Command:      command,
+		CommandIndex: commandIdnex,
+	}
 
-	return index, term, rf.role == LEADER
+	validateCnt := 0
+	replyCnt := 0
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			//自己节点
+			continue
+		}
+		request := &RequestAppendLog{
+			ApplyMsg: applyMsg,
+		}
+		reply := &RequestAppendLogReply{}
+		ok, err := rf.sendRequestApplyMessageTimeout(i, request, reply, kMinHeartbeatMs/len(rf.peers))
+		if err != nil {
+			//超时了 不处理
+		}
+		if ok && reply.Success {
+			validateCnt += 1
+		}
+	}
+	Println("node %v apply result  replyCnt:%v validateCnt:%v", rf.nodeInfo, replyCnt, validateCnt)
+	rf.lastAppliedIndex = commandIdnex
+	rf.applyCh <- applyMsg
+	return commandIdnex, term, rf.role == LEADER
 }
 
 //
@@ -592,6 +652,29 @@ func (rf *Raft) sendRequestVoteWithTimeout(i int, args *RequestVoteArgs, reply *
 
 }
 
+func (rf *Raft) sendRequestApplyMessageTimeout(i int, args *RequestAppendLog, reply *RequestAppendLogReply, timeoutMs int) (bool, error) {
+	timeout, _ := context.WithTimeout(
+		context.Background(),
+		time.Millisecond*time.Duration(timeoutMs),
+	)
+	chRet := make(chan bool)
+	go func() {
+		vote := rf.sendRequestApplyMessage(i, args, reply)
+		chRet <- vote
+	}()
+	select {
+	case ans := <-chRet:
+		return ans, nil
+	case <-timeout.Done():
+		return false, errors.New("time out")
+	}
+
+}
+
+func (rf *Raft) isLeader() bool {
+	return rf.role == LEADER
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -609,6 +692,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 	// 初始化
