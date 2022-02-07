@@ -369,6 +369,7 @@ func (rf *Raft) RequestAppendLog(args *RequestAppendLog, reply *RequestAppendLog
 	if args.Term < rf.currentTermId {
 		accept = false
 	}
+	shouldAppend := true
 	errorMessage := ""
 	if args.PrevLogIndex != 0 && args.PrevLogTerm != 0 {
 		if len(rf.logEntries) < args.PrevLogIndex {
@@ -379,6 +380,7 @@ func (rf *Raft) RequestAppendLog(args *RequestAppendLog, reply *RequestAppendLog
 			record := rf.logEntries[args.PrevLogIndex-1]
 			if record.TermId != args.PrevLogTerm {
 				accept = false
+				Println("error 222 %v", rf.logEntries)
 				errorMessage = fmt.Sprintf("error 222 term logEntries len %v prevLogIndex %v", len(rf.logEntries), args.PrevLogIndex)
 			}
 		}
@@ -390,19 +392,25 @@ func (rf *Raft) RequestAppendLog(args *RequestAppendLog, reply *RequestAppendLog
 				//删除该数据
 				Println("ndoe %v delete pre logs", rf.nodeInfo)
 				rf.logEntries = rf.logEntries[0 : args.LogRecord.LogIndex-1]
+			} else {
+				//幂等处理
+				shouldAppend = false
 			}
 		}
 	}
 
 	if accept {
 		Println("node %v accept the append log %v", rf.nodeInfo, args.LogRecord)
-		rf.logEntries = append(rf.logEntries, LogRecord{
-			TermId:   args.Term,
-			Cmd:      args.Cmd,
-			LogIndex: args.LogIndex,
-		})
-		Println("node %v append log in request %v len:%v", rf.nodeInfo, args.LogRecord, len(rf.logEntries))
 
+		if shouldAppend {
+			rf.logEntries = append(rf.logEntries, LogRecord{
+				TermId:   args.LogRecord.TermId,
+				Cmd:      args.LogRecord.Cmd,
+				LogIndex: args.LogRecord.LogIndex,
+			})
+			Println("node %v append log in request %v len:%v", rf.nodeInfo, args.LogRecord, len(rf.logEntries))
+
+		}
 		reply.Success = true
 		reply.CurrentTermId = rf.currentTermId
 	}
@@ -487,6 +495,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !rf.isLeader() {
 		return -1, -1, false
 	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// Your code here (2B).
 	commandIdnex := len(rf.logEntries) + 1
 	record := LogRecord{
@@ -607,7 +617,9 @@ func (rf *Raft) startLeaderElection() bool {
 	voteAcceptNum := 1
 	voteFailNum := 0
 	Println("node %v start to election leader use term %v\n", rf.nodeInfo, rf.currentTermId)
+	nd := rand.Intn(len(rf.nodeMap))
 	for i, _ := range rf.nodeMap {
+		i = (i + nd) % len(rf.nodeMap)
 		if i == rf.me {
 			continue
 		}
@@ -621,14 +633,14 @@ func (rf *Raft) startLeaderElection() bool {
 		}
 		requestVoteReply := &RequestVoteReply{}
 		//startTime := time.Now()
-		vote, err := rf.sendRequestVoteWithTimeout(i, voteArgs, requestVoteReply, kMinHeartbeatMs/len(rf.peers))
+		vote, err := rf.sendRequestVoteWithTimeout(i, voteArgs, requestVoteReply, kMinHeartbeatMs/len(rf.peers)+10)
 		if err != nil {
 			//超时
 			vote = false
 		}
 		if time.Now().Sub(rf.lastHeartbeatTime) > electionTimeout {
 			//选举超时 直接不选了
-			if voteAcceptNum == 1 {
+			if voteAcceptNum == 1 && voteFailNum != 1 {
 				rf.currentTermId -= 1
 			}
 			return false
@@ -667,7 +679,7 @@ func (rf *Raft) startLeaderElection() bool {
 		rf.startAppendRequest()
 		return true
 	}
-	if voteAcceptNum == 1 {
+	if voteAcceptNum == 1 && voteFailNum != 1 {
 		rf.currentTermId -= 1
 	}
 	return false
@@ -748,33 +760,37 @@ func (rf *Raft) startAppendRequest() {
 
 	for i, _ := range rf.nextIndexArr {
 		go func(i int) {
+
+			shouldTryCommitIndex := rf.nextIndexArr[i]
+			for len(rf.logEntries) > 0 && shouldTryCommitIndex >= 1 && rf.isLeader() {
+				ok, _ := rf.tryCommit(i, shouldTryCommitIndex)
+				if !ok {
+					shouldTryCommitIndex -= 1
+					Println("try_commit fail node:%v index:%v len:%v", i, shouldTryCommitIndex, len(rf.logEntries))
+				} else {
+					Println("try_commit success node:%v index:%v len:%v", i, shouldTryCommitIndex, len(rf.logEntries))
+					rf.matchIndexArr[i] = shouldTryCommitIndex
+					logRecord := rf.logEntries[shouldTryCommitIndex-1]
+					shouldTryCommitIndex += 1
+					rf.nextIndexArr[i] = shouldTryCommitIndex
+					//通知通道
+					rf.checkCommit(logRecord)
+					break
+				}
+			}
 			//只要是leader 一直执行
-			hasOk := false
 			for rf.isLeader() {
-
-				shouldTryCommitIndex := rf.nextIndexArr[i]
-				for len(rf.logEntries) > 0 && shouldTryCommitIndex >= 1 && shouldTryCommitIndex <= len(rf.logEntries)+1 {
-					ok, outRange := rf.tryCommit(i, shouldTryCommitIndex)
-					if !ok {
-						if outRange && hasOk {
-							break
-						}
-						shouldTryCommitIndex -= 1
-						Println("try_commit fail node:%v index:%v len:%v", i, shouldTryCommitIndex, len(rf.logEntries))
-
-					} else {
+				for len(rf.logEntries) > 0 && shouldTryCommitIndex >= 1 && shouldTryCommitIndex < len(rf.logEntries)+1 {
+					ok, _ := rf.tryCommit(i, shouldTryCommitIndex)
+					if ok {
 						Println("try_commit success node:%v index:%v len:%v", i, shouldTryCommitIndex, len(rf.logEntries))
 						rf.matchIndexArr[i] = shouldTryCommitIndex
 						logRecord := rf.logEntries[shouldTryCommitIndex-1]
 						shouldTryCommitIndex += 1
 						rf.nextIndexArr[i] = shouldTryCommitIndex
 						//通知通道
-						hasOk = true
 						rf.checkCommit(logRecord)
 					}
-				}
-				if shouldTryCommitIndex <= 1 {
-					shouldTryCommitIndex = 1
 				}
 				rf.nextIndexArr[i] = shouldTryCommitIndex
 				time.Sleep(50 * time.Millisecond)

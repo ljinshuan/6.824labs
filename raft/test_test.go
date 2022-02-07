@@ -72,13 +72,13 @@ func TestReElection2A(t *testing.T) {
 
 	// if there's no quorum, no leader should
 	// be elected.
-	cfg.disconnect(leader2)
-	cfg.disconnect((leader2 + 1) % servers)
+	cfg.disconnect(leader2)                 //leader掉线
+	cfg.disconnect((leader2 + 1) % servers) //leader+1掉线
 	time.Sleep(2 * RaftElectionTimeout)
-	cfg.checkNoLeader()
+	cfg.checkNoLeader() //此时没有leader
 
 	// if a quorum arises, it should elect a leader.
-	cfg.connect((leader2 + 1) % servers)
+	cfg.connect((leader2 + 1) % servers) //leader+1回来
 	cfg.checkOneLeader()
 
 	// re-join of last node shouldn't prevent leader from existing.
@@ -212,9 +212,9 @@ func TestFailAgree2B(t *testing.T) {
 	// the full set of servers should preserve
 	// previous agreements, and be able to agree
 	// on new commands.
-	cfg.one4Test(106, servers, true)
+	cfg.one(106, servers, true)
 	time.Sleep(RaftElectionTimeout)
-	//cfg.one(107, servers, true)
+	cfg.one(107, servers, true)
 
 	cfg.end()
 }
