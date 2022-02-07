@@ -554,6 +554,47 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 	return -1
 }
 
+func (cfg *config) one4Test(cmd interface{}, expectedServers int, retry bool) int {
+	t0 := time.Now()
+	starts := 0
+	//10秒钟时间
+	for time.Since(t0).Seconds() < 10000 {
+		// try all the servers, maybe one is the leader.
+		//这里是在找一个leader的索引
+		index := -1
+		for si := 0; si < cfg.n; si++ {
+			starts = (starts + 1) % cfg.n
+			var rf *Raft
+			cfg.mu.Lock()
+			if cfg.connected[starts] {
+				rf = cfg.rafts[starts]
+			}
+			cfg.mu.Unlock()
+			if rf != nil {
+				index1, _, ok := rf.Start(cmd)
+				if ok {
+					index = index1
+					break
+				}
+			}
+		}
+		time.Sleep(5000 * time.Second)
+		if index != -1 {
+			// somebody claimed to be the leader and to have
+			// submitted our command; wait a while for agreement.
+			cfg.nCommitted(index)
+			if retry == false {
+				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
+			}
+		} else {
+			//没找到50毫秒之后继续找
+			time.Sleep(500 * time.Second)
+		}
+	}
+	cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
+	return -1
+}
+
 // start a Test.
 // print the Test message.
 // e.g. cfg.begin("Test (2B): RPC counts aren't too high")

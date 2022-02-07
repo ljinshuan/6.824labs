@@ -20,7 +20,7 @@ package raft
 import (
 	"context"
 	"errors"
-	"math"
+	"fmt"
 	"math/rand"
 	//	"bytes"
 	"sync"
@@ -88,6 +88,8 @@ type Raft struct {
 	logEntries []LogRecord
 	//apply队列 apply之后把数据写到该chan中
 	applyCh chan ApplyMsg
+
+	commitCh chan LogRecord
 }
 
 type LogRecord struct {
@@ -205,6 +207,10 @@ type RequestVoteArgs struct {
 	CurrentTermId int
 	NodeId        int
 	NodeName      interface{}
+
+	//最后一个日志的信息
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -221,6 +227,7 @@ type RequestVoteReply struct {
 type RequestHeartbeat struct {
 	CurrentTermId int
 	NodeId        int
+	LeaderCommit  int
 }
 
 type RequestHeartbeatReply struct {
@@ -234,10 +241,8 @@ type RequestAppendLog struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      []LogRecord
+	LogRecord
 	LeaderCommit int
-
-	ApplyMsg
 }
 
 type RequestAppendLogReply struct {
@@ -291,6 +296,7 @@ func (rf *Raft) followLeaderState(args *RequestHeartbeat, reply *RequestHeartbea
 	}
 	rf.leaderId = args.NodeId
 	rf.role = FOLLOWER
+	rf.commitIndex = args.LeaderCommit
 
 	reply.Valide = true
 	reply.NodeId = rf.nodeInfo.NodeId
@@ -306,8 +312,29 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	Println("clientId:%v  receive RequestVote:%v\n", rf.me, args)
+	//Println("clientId:%v  currentTermId:%v  receive RequestVote:%v  \n", rf.me, rf.currentTermId, args)
+
+	accept := false
 	if rf.currentTermId < args.CurrentTermId {
+		record := rf.getLastLog()
+		term := args.LastLogTerm
+		index := args.LastLogIndex
+		accept = true
+		if record.TermId > term {
+			//比较最后一条日志的任期号 如果比候选人大 直接拒绝
+			accept = false
+			reply.Message = "record.TermId > term "
+		} else if record.TermId == term && record.LogIndex > index {
+			//如果相等 继续比较index
+			accept = false
+			reply.Message = "record.TermId == term && record.LogIndex > index"
+		}
+	} else {
+		accept = false
+		reply.Message = "less termId"
+	}
+
+	if accept {
 		//当前任期 比期望投票的任期小 同意投票
 		reply.Accept = true
 		reply.Message = "accept vote"
@@ -321,7 +348,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		//拒绝
 		reply.Accept = false
-		reply.Message = "less termId"
 		reply.TermId = rf.currentTermId
 	}
 
@@ -330,6 +356,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) RequestAppendLog(args *RequestAppendLog, reply *RequestAppendLogReply) {
 
 	Println("node %v get append request %v", rf.nodeInfo, args)
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	if rf.role != FOLLOWER {
 		reply.Success = false
@@ -340,49 +369,55 @@ func (rf *Raft) RequestAppendLog(args *RequestAppendLog, reply *RequestAppendLog
 	if args.Term < rf.currentTermId {
 		accept = false
 	}
+	errorMessage := ""
 	if args.PrevLogIndex != 0 && args.PrevLogTerm != 0 {
 		if len(rf.logEntries) < args.PrevLogIndex {
 			//长度小于这个值 不可能有数据
 			accept = false
+			errorMessage = fmt.Sprintf("error 111 logEntries len %v prevLogIndex %v", len(rf.logEntries), args.PrevLogIndex)
 		} else {
 			record := rf.logEntries[args.PrevLogIndex-1]
 			if record.TermId != args.PrevLogTerm {
 				accept = false
+				errorMessage = fmt.Sprintf("error 222 term logEntries len %v prevLogIndex %v", len(rf.logEntries), args.PrevLogIndex)
 			}
 		}
 
-		if len(rf.logEntries) >= args.CommandIndex {
-			record := rf.logEntries[args.CommandIndex-1]
+		if len(rf.logEntries) >= args.LogRecord.LogIndex {
+			record := rf.logEntries[args.LogRecord.LogIndex-1]
 			//这个index已经有log了 检查term
 			if record.TermId != args.Term {
 				//删除该数据
-				rf.logEntries = rf.logEntries[0 : args.CommandIndex-1]
+				Println("ndoe %v delete pre logs", rf.nodeInfo)
+				rf.logEntries = rf.logEntries[0 : args.LogRecord.LogIndex-1]
 			}
 		}
 	}
 
 	if accept {
-
+		Println("node %v accept the append log %v", rf.nodeInfo, args.LogRecord)
 		rf.logEntries = append(rf.logEntries, LogRecord{
 			TermId:   args.Term,
-			Cmd:      args.Command,
-			LogIndex: args.CommandIndex,
+			Cmd:      args.Cmd,
+			LogIndex: args.LogIndex,
 		})
-		rf.lastAppliedIndex = args.CommandIndex
+		Println("node %v append log in request %v len:%v", rf.nodeInfo, args.LogRecord, len(rf.logEntries))
 
 		reply.Success = true
 		reply.CurrentTermId = rf.currentTermId
 	}
 
 	if !accept {
+		Println("node %v reject the append log %v %v", rf.nodeInfo, args.LogRecord, errorMessage)
 		reply.Success = false
 		reply.CurrentTermId = rf.currentTermId
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(args.CommandIndex)))
+		rf.commitIndex = Min(args.LeaderCommit, args.LogRecord.LogIndex)
 	}
-
+	//通知应用
+	//rf.applyNotifyCh <- struct{}{}
 }
 
 //
@@ -453,21 +488,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 	// Your code here (2B).
-	commandIdnex := rf.lastAppliedIndex + 1
-	applyMsg := ApplyMsg{
-		CommandValid: true,
-		Command:      command,
-		CommandIndex: commandIdnex,
-	}
-	rf.logEntries = append(rf.logEntries, LogRecord{
+	commandIdnex := len(rf.logEntries) + 1
+	record := LogRecord{
 		TermId:   rf.currentTermId,
 		Cmd:      command,
 		LogIndex: commandIdnex,
-	})
-	go rf.startAgreementApply(applyMsg)
+	}
+	rf.logEntries = append(rf.logEntries, record)
+	Println("node %v append log in start %v len:%v", rf.nodeInfo, record, len(rf.logEntries))
 
-	rf.lastAppliedIndex = commandIdnex
-	rf.applyCh <- applyMsg
 	return commandIdnex, term, rf.role == LEADER
 }
 
@@ -551,6 +580,8 @@ func (rf *Raft) init() {
 		nextIndexArr:  make([]int, len(rf.peers)),
 		matchIndexArr: make([]int, len(rf.peers)),
 	}
+	rf.commitCh = make(chan LogRecord)
+	rf.startApplyLogLoop()
 }
 
 func (rf *Raft) startLeaderElection() bool {
@@ -562,7 +593,7 @@ func (rf *Raft) startLeaderElection() bool {
 		return true
 	}
 	electionTimeout := time.Duration(rand.Intn(kMaxHeartbeatMs-kMinHeartbeatMs)+kMaxHeartbeatMs) / 2 * time.Millisecond
-	Println("node %v start to election leader \n", rf.nodeInfo)
+
 	//状态转变
 	rf.role = CANDIDATE
 	rf.voteFor = &VoteInfo{
@@ -575,18 +606,21 @@ func (rf *Raft) startLeaderElection() bool {
 	//自己有一票投自己
 	voteAcceptNum := 1
 	voteFailNum := 0
-
+	Println("node %v start to election leader use term %v\n", rf.nodeInfo, rf.currentTermId)
 	for i, _ := range rf.nodeMap {
 		if i == rf.me {
 			continue
 		}
+		record := rf.getLastLog()
 		voteArgs := &RequestVoteArgs{
 			CurrentTermId: rf.currentTermId,
 			NodeId:        rf.nodeInfo.NodeId,
 			NodeName:      rf.nodeInfo.NodeName,
+			LastLogIndex:  record.LogIndex,
+			LastLogTerm:   record.TermId,
 		}
 		requestVoteReply := &RequestVoteReply{}
-		startTime := time.Now()
+		//startTime := time.Now()
 		vote, err := rf.sendRequestVoteWithTimeout(i, voteArgs, requestVoteReply, kMinHeartbeatMs/len(rf.peers))
 		if err != nil {
 			//超时
@@ -594,6 +628,9 @@ func (rf *Raft) startLeaderElection() bool {
 		}
 		if time.Now().Sub(rf.lastHeartbeatTime) > electionTimeout {
 			//选举超时 直接不选了
+			if voteAcceptNum == 1 {
+				rf.currentTermId -= 1
+			}
 			return false
 		}
 		if rf.role == FOLLOWER {
@@ -601,16 +638,16 @@ func (rf *Raft) startLeaderElection() bool {
 			Println("node %v change to FOLLOWER when vote.\n", rf.nodeInfo)
 			return false
 		}
-		endTime := time.Now()
+		//endTime := time.Now()
 		if vote && requestVoteReply.Accept {
 			voteAcceptNum += 1
-			Println("node %v ask for vote %v success cost:%v\n", rf.nodeInfo, i, endTime.Sub(startTime).Milliseconds())
+			//Println("node %v ask for vote %v success cost:%v\n", rf.nodeInfo, i, endTime.Sub(startTime).Milliseconds())
 		} else {
 			if !vote {
 				requestVoteReply.Message = "call fail"
 				voteFailNum += 1
 			}
-			Println("node %v ask for vote %v fail %v cost:%v\n", rf.nodeInfo, i, requestVoteReply, endTime.Sub(startTime).Milliseconds())
+			//Println("node %v ask for vote %v fail %v cost:%v\n", rf.nodeInfo, i, requestVoteReply, endTime.Sub(startTime).Milliseconds())
 			if requestVoteReply.TermId > rf.currentTermId {
 				//如果返回值的termId比当前大  直接转换为follower
 				rf.currentTermId = requestVoteReply.TermId
@@ -624,9 +661,14 @@ func (rf *Raft) startLeaderElection() bool {
 	if voteAcceptNum > (len(rf.peers)-voteFailNum)/2 && voteAcceptNum >= 2 {
 		//超过一半投自己 开始转变角色
 		rf.role = LEADER
-		Println("node:%v become leader\n", rf.nodeInfo)
+		Println("node:%v become leader as term:%v %v  commitIndex:%v lastAppliedIndex:%v\n", rf.nodeInfo, rf.currentTermId, rf.logEntries, rf.commitIndex, rf.lastAppliedIndex)
+		rf.initLeaderLogInfo()
 		rf.sendHeartbeat2Others()
+		rf.startAppendRequest()
 		return true
+	}
+	if voteAcceptNum == 1 {
+		rf.currentTermId -= 1
 	}
 	return false
 }
@@ -646,6 +688,7 @@ func (rf *Raft) sendHeartbeat2Others() {
 					rf.sendRequestHeartbeat(index, &RequestHeartbeat{
 						CurrentTermId: rf.currentTermId,
 						NodeId:        rf.nodeInfo.NodeId,
+						LeaderCommit:  rf.commitIndex,
 					}, r)
 					if r.CurrentTermId > rf.currentTermId {
 						rf.currentTermId = r.CurrentTermId
@@ -701,54 +744,156 @@ func (rf *Raft) isLeader() bool {
 	return rf.role == LEADER
 }
 
-func (rf *Raft) startAgreementApply(applyMsg ApplyMsg) {
+func (rf *Raft) startAppendRequest() {
+
+	for i, _ := range rf.nextIndexArr {
+		go func(i int) {
+			//只要是leader 一直执行
+			hasOk := false
+			for rf.isLeader() {
+
+				shouldTryCommitIndex := rf.nextIndexArr[i]
+				for len(rf.logEntries) > 0 && shouldTryCommitIndex >= 1 && shouldTryCommitIndex <= len(rf.logEntries)+1 {
+					ok, outRange := rf.tryCommit(i, shouldTryCommitIndex)
+					if !ok {
+						if outRange && hasOk {
+							break
+						}
+						shouldTryCommitIndex -= 1
+						Println("try_commit fail node:%v index:%v len:%v", i, shouldTryCommitIndex, len(rf.logEntries))
+
+					} else {
+						Println("try_commit success node:%v index:%v len:%v", i, shouldTryCommitIndex, len(rf.logEntries))
+						rf.matchIndexArr[i] = shouldTryCommitIndex
+						logRecord := rf.logEntries[shouldTryCommitIndex-1]
+						shouldTryCommitIndex += 1
+						rf.nextIndexArr[i] = shouldTryCommitIndex
+						//通知通道
+						hasOk = true
+						rf.checkCommit(logRecord)
+					}
+				}
+				if shouldTryCommitIndex <= 1 {
+					shouldTryCommitIndex = 1
+				}
+				rf.nextIndexArr[i] = shouldTryCommitIndex
+				time.Sleep(50 * time.Millisecond)
+			}
+		}(i)
+	}
+
+}
+
+func (rf *Raft) tryCommit(serverNode int, shouldTryCommitIndex int) (bool, bool) {
 
 	if !rf.isLeader() {
-		return
+		return false, false
 	}
-	validateCnt := 0
-	replyCnt := 0
+	if len(rf.logEntries) < shouldTryCommitIndex || shouldTryCommitIndex < 1 {
+		return false, true
+	}
+	if serverNode == rf.me {
+		//如果是自己 直接成功
+		return true, false
+	}
+
 	//取上一条日志
-	var record LogRecord = LogRecord{
+	preRecord := LogRecord{
 		TermId:   0,
+		Cmd:      nil,
+		LogIndex: 0,
+	}
+	logRecord := rf.logEntries[shouldTryCommitIndex-1]
+	if logRecord.LogIndex-2 >= 0 && len(rf.logEntries) > 1 {
+		preRecord = rf.logEntries[logRecord.LogIndex-2]
+	}
+
+	request := &RequestAppendLog{
+		Term:         rf.currentTermId,
+		LeaderId:     rf.nodeInfo.NodeId,
+		PrevLogIndex: preRecord.LogIndex,
+		PrevLogTerm:  preRecord.TermId,
+		LogRecord:    logRecord,
+		LeaderCommit: rf.commitIndex,
+	}
+	Println("%v sendRequestApplyMessageTimeout %v %v", rf.nodeInfo, rf.logEntries, request)
+	reply := &RequestAppendLogReply{}
+	ok, err := rf.sendRequestApplyMessageTimeout(serverNode, request, reply, kMinHeartbeatMs)
+	if err != nil {
+		//超时了 不处理
+	}
+	if reply.CurrentTermId > rf.currentTermId {
+		rf.currentTermId = reply.CurrentTermId
+		rf.role = FOLLOWER
+		return false, false
+	}
+	if ok && reply.Success {
+		return true, false
+	}
+	return false, false
+
+}
+
+func (rf *Raft) startApplyLogLoop() {
+
+	go func() {
+		for true {
+			//等待通知
+			for rf.commitIndex > rf.lastAppliedIndex && len(rf.logEntries) > rf.lastAppliedIndex {
+				record := rf.logEntries[rf.lastAppliedIndex]
+				Println("node %v apply log %v", rf.nodeInfo, record)
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      record.Cmd,
+					CommandIndex: record.LogIndex,
+				}
+				rf.lastAppliedIndex += 1
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+	}()
+}
+
+func (rf *Raft) getLastLog() LogRecord {
+
+	record := LogRecord{
+		TermId:   0,
+		Cmd:      nil,
 		LogIndex: 0,
 	}
 	if len(rf.logEntries) > 0 {
-		record = rf.logEntries[applyMsg.CommandIndex-1]
+		record = rf.logEntries[len(rf.logEntries)-1]
 	}
-	for i, _ := range rf.peers {
-		if i == rf.me {
-			//自己节点
-			continue
-		}
-		request := &RequestAppendLog{
-			Term:         rf.currentTermId,
-			LeaderId:     rf.nodeInfo.NodeId,
-			PrevLogIndex: record.LogIndex,
-			PrevLogTerm:  record.TermId,
-			Entries:      nil,
-			LeaderCommit: rf.commitIndex,
-			ApplyMsg:     applyMsg,
-		}
-		reply := &RequestAppendLogReply{}
-		ok, err := rf.sendRequestApplyMessageTimeout(i, request, reply, kMinHeartbeatMs/len(rf.peers))
-		if err != nil {
-			//超时了 不处理
-		}
-		if ok && reply.Success {
-			validateCnt += 1
-		}
-		if reply.CurrentTermId > rf.currentTermId {
-			rf.currentTermId = reply.CurrentTermId
-			rf.role = FOLLOWER
+	return record
+}
+
+func (rf *Raft) initLeaderLogInfo() {
+
+	for i, _ := range rf.nextIndexArr {
+		rf.nextIndexArr[i] = len(rf.logEntries) + 1
+	}
+	for i, _ := range rf.matchIndexArr {
+		rf.matchIndexArr[i] = 0
+	}
+}
+
+func (rf *Raft) checkCommit(logRecord LogRecord) {
+
+	if logRecord.TermId != rf.currentTermId {
+		return
+	}
+	if logRecord.LogIndex <= rf.commitIndex {
+		return
+	}
+	count := 0
+	for _, v := range rf.matchIndexArr {
+		if logRecord.LogIndex <= v {
+			count += 1
 		}
 	}
-	Println("node %v apply result  replyCnt:%v validateCnt:%v", rf.nodeInfo, replyCnt, validateCnt)
-	//超过半数同意 提交
-	if validateCnt >= 1 && validateCnt >= replyCnt/2 {
-		//提交
-		rf.commitIndex = applyMsg.CommandIndex
-		rf.applyCh <- applyMsg
+	if count > len(rf.matchIndexArr)/2 {
+		rf.commitIndex = logRecord.LogIndex
 	}
 }
 

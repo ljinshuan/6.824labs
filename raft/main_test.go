@@ -40,3 +40,14 @@ func TestSubSlic(t *testing.T) {
 	a := abc[0:2]
 	fmt.Println(a)
 }
+
+func TestWg(t *testing.T) {
+
+	ch1 := make(chan struct{})
+	ch1 <- struct{}{}
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		ch1 <- struct{}{}
+	}()
+	fmt.Println("hello", <-ch1)
+}
